@@ -20,10 +20,11 @@ byte incomingByte;
 byte incomingBytePrev;
 
 //rolling buffer to store last 50 samples
-int16_t speed_right[50] = {0};
+int16_t left_dc_curr_buf[50] = {0};
 int16_t speed_left[50] = {0};
 int16_t batVoltage_buf[50] = {0};
 int16_t temp_board_buf[50] = {0};
+int16_t iq_buf[50] = {0};
 long timestamps_buff[50] = {0};
 int buffer_index = 0; //rolling index
 
@@ -133,6 +134,12 @@ void Receive()
       //     Feedback.batVoltage	    = (int16_t)batVoltageCalib;
       //     Feedback.boardTemp	    = (int16_t)board_temp_deg_c;
 
+      // int16_t left_dc_curr;            // global variable for Left DC Link current
+      /* Outport: '<Root>/iq' */
+      // rtY->iq = rtDW->DataTypeConversion[0];
+
+      /* Outport: '<Root>/id' */
+      // rtY->id = rtDW->DataTypeConversion[1];
       //     #if defined(FEEDBACK_SERIAL_USART2)
       //       if(__HAL_DMA_GET_COUNTER(huart2.hdmatx) == 0) {
       //         Feedback.cmdLed     = (uint16_t)sideboard_leds_L;
@@ -160,10 +167,11 @@ void Receive()
       // Serial.println(Feedback.cmdLed);
 
       // store in buffer instead of fludding serial
-      speed_right[buffer_index] = Feedback.speedR_meas;
+      left_dc_curr_buf[buffer_index] = Feedback.speedR_meas;
       speed_left[buffer_index] = Feedback.speedL_meas;
       batVoltage_buf[buffer_index] = Feedback.batVoltage;
       temp_board_buf[buffer_index] = Feedback.boardTemp;
+      iq_buf[buffer_index] = Feedback.cmd2;
       timestamps_buff[buffer_index] = millis();
       buffer_index = buffer_index + 1;
 
@@ -209,7 +217,7 @@ void loop(void)
     b = micros();
     /* Tasklist: 10 ms */
 
-    Send(0, -200); //Send(int16_t uSteer, int16_t uSpeed)
+    Send(0, 200); //Send(int16_t uSteer, int16_t uSpeed)
                   // Receive(); // Check for new received data
   }
   else if (micros() < b)
@@ -237,13 +245,15 @@ void loop(void)
     // only print first element of buffer
     Serial.print("  timestamp:");
     Serial.print(timestamps_buff[buffer_index]);
-    Serial.print("  spd_act_rght:");
-    Serial.print(speed_right[buffer_index]);
-    Serial.print("  spd_act_lft:");
-    Serial.print(speed_left[buffer_index]);
+    Serial.print("  left_dc_current[cA]:");
+    Serial.print(left_dc_curr_buf[buffer_index]);
     Serial.print("  batt_vlt:");
     Serial.print(batVoltage_buf[buffer_index]);
-    Serial.print("  temper:");
+    Serial.print("  spd_act_lft[rpm]:");
+    Serial.print(speed_left[buffer_index]);
+    Serial.print("  iq[cA?]:");
+    Serial.print(iq_buf[buffer_index]);
+    Serial.print("  temper [deci Cels]:");
     Serial.println(temp_board_buf[buffer_index]);
     // for (int i = 0; i < 50; i++)
     // {
