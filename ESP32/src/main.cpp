@@ -1,35 +1,386 @@
+// changelog
+// 31 may 2021: added multiple BLE characteristics
+// 01 jun 2021: added three BLE characteristics, added absolute value check to charge battery
+// 6 jun 2021: trying to avoid time-outs
+// 14 jun 2021: included bluetooth low energy over the air update from Felix Biego https://github.com/fbiego/ESP32_BLE_OTA_Arduino --> not functioning yet
+
 #include <Arduino.h>
+#include <Update.h>
+#include "FS.h"
+#include "FFat.h"
+#include "SPIFFS.h"
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
-// #include "BluetoothSerial.h"
+#include <BLE2902.h>
+
+#define SERIAL_BAUD 57600 // [-] Baud rate for built-in Serial (used for the Serial Monitor)
 
 #define HOVER_SERIAL_BAUD 115200 // [-] Baud rate for Serial2 (used to communicate with the hoverboard)
-#define SERIAL_BAUD 57600        // [-] Baud rate for built-in Serial (used for the Serial Monitor)
-#define START_FRAME 0xABCD       // [-] Start frme definition for reliable serial communication
-// #define DEBUG_RX                // [-] Debug received data. Prints all bytes to serial (comment-out to disable)
+#define START_FRAME 0xABCD
+#define CONNECTED_TO_PC 1 // to enable/disable serial printout
 
 //only pick one taskrate for this simple test
-#define TASK_1000MS 1 //simple task scheduling of 1 second
+#define TASK_20000MS 1 //simple task scheduling of 20 second
+#define TASK_1000MS 1  //simple task scheduling of 1 second
 #define TASK_500MS 1
 #define TASK_200MS 1 //simple task scheduling of 200ms
 #define TASK_10MS 1
 #define TASK_5MS 0
 
-#define CONNECTED_TO_PC 0 // to enable/disable serial printout
-#define SPEEDLOOP_ESP 1
+#define BLUETOOTH 1 // to send BLE messages
 
-// BLE is much more cumbersome versus bluetoothserial :(
-// install a BLE scanner on your phone and look for the UUID to see a value getting updated on request ...
+#if BLUETOOTH
+BLEServer *pServer;
+BLEService *pService;
+BLEAdvertising *pAdvertising;
 
-// BluetoothSerial ESP_BT; //Object for Bluetooth
-BLECharacteristic *pCharacteristic;
+BLECharacteristic *pCharacteristic1;
+BLECharacteristic *pCharacteristic2;
+BLECharacteristic *pCharacteristic3;
+BLECharacteristic *pCharacteristic4;
+
+static BLECharacteristic *pCharacteristicTX;
+static BLECharacteristic *pCharacteristicRX;
+
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"  //power
+#define CHARACTERISTIC2_UUID "688091db-1736-4179-b7ce-e42a724a6a68" //battery voltage
+#define CHARACTERISTIC3_UUID "d240dbed-7d22-45bb-b810-add58a6c856b" // rpm
+#define CHARACTERISTIC4_UUID "41e5e3f7-47e2-4885-945c-9dda1fc1dc7c" // operating state
 
-float motorconstant = 30; // Nm/cA
+#define SERVICE_UUID2 "fb1e4001-54ae-4a28-9f74-dfccb248601d"
+#define CHARACTERISTIC_UUID_RX "fb1e4002-54ae-4a28-9f74-dfccb248601d"
+#define CHARACTERISTIC_UUID_TX "fb1e4003-54ae-4a28-9f74-dfccb248601d"
 
-// Global variables
+// BLUETOOTH OTA definitions
+#define BUILTINLED 2
+#define FORMAT_SPIFFS_IF_FAILED true
+#define FORMAT_FFAT_IF_FAILED true
+#define USE_SPIFFS //comment to use FFat
+
+#ifdef USE_SPIFFS
+#define FLASH SPIFFS
+#define FASTMODE false //SPIFFS write is slow
+#else
+#define FLASH FFat
+#define FASTMODE true //FFat is faster
+#endif
+
+#define NORMAL_MODE 0 // normal
+#define UPDATE_MODE 1 // receiving firmware
+#define OTA_MODE 2    // installing firmware
+
+uint8_t updater[16384];
+uint8_t updater2[16384];
+
+static bool deviceConnected = false, sendMode = false;
+static bool writeFile = false, request = false;
+static int writeLen = 0, writeLen2 = 0;
+static bool current = true;
+static int parts = 0, next = 0, cur = 0, MTU = 0;
+static int MODE = NORMAL_MODE;
+
+/////////////////////////////////////////////////////////////////////////////////
+////////////////////// FUNCTIONS BLE-OTA/////////////////////////////////////////
+
+static void rebootEspWithReason(String reason)
+{
+  Serial.println(reason);
+  delay(1000);
+  ESP.restart();
+}
+
+class MyServerCallbacks : public BLEServerCallbacks
+{
+  void onConnect(BLEServer *pServer)
+  {
+    deviceConnected = true;
+  }
+  void onDisconnect(BLEServer *pServer)
+  {
+    deviceConnected = false;
+  }
+};
+
+class MyCallbacks : public BLECharacteristicCallbacks
+{
+
+  //    void onStatus(BLECharacteristic* pCharacteristic, Status s, uint32_t code) {
+  //      Serial.print("Status ");
+  //      Serial.print(s);
+  //      Serial.print(" on characteristic ");
+  //      Serial.print(pCharacteristic->getUUID().toString().c_str());
+  //      Serial.print(" with code ");
+  //      Serial.println(code);
+  //    }
+
+  void onNotify(BLECharacteristic *pCharacteristic)
+  {
+    uint8_t *pData;
+    std::string value = pCharacteristic->getValue();
+    int len = value.length();
+    pData = pCharacteristic->getData();
+    if (pData != NULL)
+    {
+      //        Serial.print("Notify callback for characteristic ");
+      //        Serial.print(pCharacteristic->getUUID().toString().c_str());
+      //        Serial.print(" of data length ");
+      //        Serial.println(len);
+      Serial.print("TX  ");
+      for (int i = 0; i < len; i++)
+      {
+        Serial.printf("%02X ", pData[i]);
+      }
+      Serial.println();
+    }
+  }
+
+  void onWrite(BLECharacteristic *pCharacteristic)
+  {
+    uint8_t *pData;
+    std::string value = pCharacteristic->getValue();
+    int len = value.length();
+    pData = pCharacteristic->getData();
+    if (pData != NULL)
+    {
+      //        Serial.print("Write callback for characteristic ");
+      //        Serial.print(pCharacteristic->getUUID().toString().c_str());
+      //        Serial.print(" of data length ");
+      //        Serial.println(len);
+      //        Serial.print("RX  ");
+      //        for (int i = 0; i < len; i++) {         // leave this commented
+      //          Serial.printf("%02X ", pData[i]);
+      //        }
+      //        Serial.println();
+
+      if (pData[0] == 0xFB)
+      {
+        int pos = pData[1];
+        for (int x = 0; x < len - 2; x++)
+        {
+          if (current)
+          {
+            updater[(pos * MTU) + x] = pData[x + 2];
+          }
+          else
+          {
+            updater2[(pos * MTU) + x] = pData[x + 2];
+          }
+        }
+      }
+      else if (pData[0] == 0xFC)
+      {
+        if (current)
+        {
+          writeLen = (pData[1] * 256) + pData[2];
+        }
+        else
+        {
+          writeLen2 = (pData[1] * 256) + pData[2];
+        }
+        current = !current;
+        cur = (pData[3] * 256) + pData[4];
+        writeFile = true;
+        if (cur < parts - 1)
+        {
+          request = !FASTMODE;
+        }
+      }
+      else if (pData[0] == 0xFD)
+      {
+        sendMode = true;
+        if (FLASH.exists("/update.bin"))
+        {
+          FLASH.remove("/update.bin");
+        }
+      }
+      else if (pData[0] == 0xFF)
+      {
+        parts = (pData[1] * 256) + pData[2];
+        MTU = (pData[3] * 256) + pData[4];
+        MODE = UPDATE_MODE;
+      }
+    }
+  }
+};
+
+static void writeBinary(fs::FS &fs, const char *path, uint8_t *dat, int len)
+{
+
+  Serial.printf("Write binary file %s\r\n", path);
+  File file = fs.open(path, FILE_APPEND);
+
+  if (!file)
+  {
+    Serial.println("- failed to open file for writing");
+    return;
+  }
+  file.write(dat, len);
+  file.close();
+}
+
+void sendOtaResult(String result)
+{
+  pCharacteristicTX->setValue(result.c_str());
+  pCharacteristicTX->notify();
+  delay(200);
+}
+
+void performUpdate(Stream &updateSource, size_t updateSize)
+{
+  char s1 = 0x0F;
+  String result = String(s1);
+  if (Update.begin(updateSize))
+  {
+    size_t written = Update.writeStream(updateSource);
+    if (written == updateSize)
+    {
+      Serial.println("Written : " + String(written) + " successfully");
+    }
+    else
+    {
+      Serial.println("Written only : " + String(written) + "/" + String(updateSize) + ". Retry?");
+    }
+    result += "Written : " + String(written) + "/" + String(updateSize) + " [" + String((written / updateSize) * 100) + "%] \n";
+    if (Update.end())
+    {
+      Serial.println("OTA done!");
+      result += "OTA Done: ";
+      if (Update.isFinished())
+      {
+        Serial.println("Update successfully completed. Rebooting...");
+        result += "Success!\n";
+      }
+      else
+      {
+        Serial.println("Update not finished? Something went wrong!");
+        result += "Failed!\n";
+      }
+    }
+    else
+    {
+      Serial.println("Error Occurred. Error #: " + String(Update.getError()));
+      result += "Error #: " + String(Update.getError());
+    }
+  }
+  else
+  {
+    Serial.println("Not enough space to begin OTA");
+    result += "Not enough space for OTA";
+  }
+  if (deviceConnected)
+  {
+    sendOtaResult(result);
+    delay(5000);
+  }
+}
+
+void updateFromFS(fs::FS &fs)
+{
+  File updateBin = fs.open("/update.bin");
+  if (updateBin)
+  {
+    if (updateBin.isDirectory())
+    {
+      Serial.println("Error, update.bin is not a file");
+      updateBin.close();
+      return;
+    }
+
+    size_t updateSize = updateBin.size();
+
+    if (updateSize > 0)
+    {
+      Serial.println("Trying to start update");
+      performUpdate(updateBin, updateSize);
+    }
+    else
+    {
+      Serial.println("Error, file is empty");
+    }
+
+    updateBin.close();
+
+    // when finished remove the binary from spiffs to indicate end of the process
+    Serial.println("Removing update file");
+    fs.remove("/update.bin");
+
+    rebootEspWithReason("Rebooting to complete OTA update");
+  }
+  else
+  {
+    Serial.println("Could not load update.bin from spiffs root");
+  }
+}
+
+void initBLE()
+{
+  BLEDevice::init("ESP32 Hover");
+  // BLEServer *pServer = BLEDevice::createServer();
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService2 = pServer->createService(SERVICE_UUID2);
+  // pService = pServer->createService(SERVICE_UUID2);
+  pCharacteristicTX = pService2->createCharacteristic(CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY);
+  pCharacteristicRX = pService2->createCharacteristic(CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  pCharacteristicRX->setCallbacks(new MyCallbacks());
+  pCharacteristicTX->setCallbacks(new MyCallbacks());
+  pCharacteristicTX->addDescriptor(new BLE2902());
+  pCharacteristicTX->setNotifyProperty(true);
+  pService2->start();
+
+  //get other data over bluetooth
+  // pService = pServer->createService(SERVICE_UUID2);
+  pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic1 = pService->createCharacteristic(
+      CHARACTERISTIC_UUID,
+      BLECharacteristic::PROPERTY_READ |
+          BLECharacteristic::PROPERTY_WRITE);
+  pCharacteristic1->setValue("Start1");
+
+  pCharacteristic2 = pService->createCharacteristic(
+      CHARACTERISTIC2_UUID,
+      BLECharacteristic::PROPERTY_READ |
+          BLECharacteristic::PROPERTY_WRITE);
+  pCharacteristic2->setValue("start2");
+
+  pCharacteristic3 = pService->createCharacteristic(
+      CHARACTERISTIC3_UUID,
+      BLECharacteristic::PROPERTY_READ |
+          BLECharacteristic::PROPERTY_WRITE);
+  pCharacteristic3->setValue("start3");
+
+  pCharacteristic4 = pService->createCharacteristic(
+      CHARACTERISTIC4_UUID,
+      BLECharacteristic::PROPERTY_READ |
+          BLECharacteristic::PROPERTY_WRITE);
+  pCharacteristic4->setValue("start4");
+  pService->start();
+  //  pAdvertising = pServer->getAdvertising();
+  //  pAdvertising->addServiceUUID(pService->getUUID());
+  //  pAdvertising->start();
+
+  //BLEAdvertising *pAdvertising2 = pServer->getAdvertising(); // this still is working for backward compatibility
+  BLEAdvertising *pAdvertising2 = BLEDevice::getAdvertising();
+  //pAdvertising2->addServiceUUID(SERVICE_UUID);
+  pAdvertising2->addServiceUUID(SERVICE_UUID2);
+  pAdvertising2->setScanResponse(true);
+  pAdvertising2->setMinPreferred(0x06); // functions that help with iPhone connections issue
+  pAdvertising2->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+#if CONNECTED_TO_PC
+  Serial.println("Characteristic defined! Now you can read it in your phone!");
+  Serial.println("Value Characteristic defined");
+#endif
+}
+
+#endif
+/////////////////////////////////////////////////////////////////////////////////
+////////////////////// FUNCTIONS and structs HOVER /////////////////////////////////////////
+// Global variables hoverboard
 uint8_t idx = 0;        // Index for new data pointer
 uint16_t bufStartFrame; // Buffer Start Frame
 byte *p;                // Pointer declaration for the new received data
@@ -92,8 +443,13 @@ struct ctrl_Motor
 };
 struct ctrl_Motor ctrl_Motor_state = {0, 0, 0, 0};
 
-/////////////////////////////////////////////////////////////////////////////////
-////////////////////// FUNCTIONS /////////////////////////////////////////
+void send_BLE(int16_t value, BLECharacteristic *pCharacteristic)
+{
+  char buffer[80];
+  dtostrf(value, 1, 2, buffer);
+  pCharacteristic->setValue(buffer);
+  pCharacteristic->notify(); // send notification of change
+}
 
 void Send(int16_t uSteer, int16_t uSpeed)
 {
@@ -307,7 +663,7 @@ struct ctrl_Motor ChargeBattery(float powerMotr_watt, int16_t speed_mtr, float c
 
   // torque command is low and motor is rotating --> turbine is generating and overcoming the "electric brake" torque
   // increase speed to get to a more efficient zone
-  if ((speed_mtr > 60) && (command_trq < 25))
+  if ((speed_mtr > 50) && (abs(command_trq) < 25))
   {
     ctrl_MtrOut.Speedloop_enable = 1;
     ctrl_MtrOut.Speedloop_setp = 200;
@@ -338,58 +694,55 @@ struct ctrl_Motor ChargeBattery(float powerMotr_watt, int16_t speed_mtr, float c
   return ctrl_MtrOut;
 }
 
-void send_BLE(int16_t value)
-{
-  char buffer[80];
-  dtostrf(value, 1, 2, buffer);
-  pCharacteristic->setValue(buffer);
-  pCharacteristic->notify(); // send notification of change
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////
-// ########################## repeating loops ##########################
-//////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////
+//////////////////////// execution
 
 void setup()
 {
-  // put your setup code here, run once at startup:
-
-  setCpuFrequencyMhz(80); //powering from the 5v of the hall sensors, reducing clock frequency hoping not to exceed 100mA
-
-  pinMode(BUILTIN_LED, OUTPUT);
-#if CONNECTED_TO_PC
-  Serial.begin(SERIAL_BAUD); //this is printed to monitor through computer
-  Serial.println("Hoverboard Serial test");
-#endif
-
+  // setCpuFrequencyMhz(80);           //powering from the 5v of the hall sensors, reducing clock frequency hoping not to exceed 100mA
   Serial2.begin(HOVER_SERIAL_BAUD); //used to communicate with hoverboard
 
-#if SPEEDLOOP_ESP
-      // PI controller for voltage regulation
+#if CONNECTED_TO_PC
+  Serial.begin(SERIAL_BAUD);
+  Serial.println("Starting BLE OTA sketch");
+#endif
+  pinMode(BUILTINLED, OUTPUT);
+
+  // PI controller for voltage regulation
   PI_speed.Kp = 0.3;
   PI_speed.Ti = 0.4;
   PI_speed.mem1 = 0;
   PI_speed.mem2 = 0;
   PI_speed.output = 0;
   PI_speed.samplingtime = 0.2;
-#endif
 
   // ESP_BT.begin("ESP32_Wind"); //Name of your Bluetooth Signal
+#if BLUETOOTH
 
-  BLEDevice::init("ESP32_hover");
-  BLEServer *pServer = BLEDevice::createServer();
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-  pCharacteristic = pService->createCharacteristic(
-      CHARACTERISTIC_UUID,
-      BLECharacteristic::PROPERTY_READ |
-          BLECharacteristic::PROPERTY_WRITE);
+#ifdef USE_SPIFFS
+  if (!SPIFFS.begin(FORMAT_SPIFFS_IF_FAILED))
+  {
+    Serial.println("SPIFFS Mount Failed");
+    return;
+  }
+#else
+  if (!FFat.begin())
+  {
+    Serial.println("FFat Mount Failed");
+    if (FORMAT_FFAT_IF_FAILED)
+      FFat.format();
+    return;
+  }
+#endif
 
-  pService->start();
-  BLEAdvertising *pAdvertising = pServer->getAdvertising();
-  pAdvertising->addServiceUUID(pService->getUUID());
-  pAdvertising->start();
+  initBLE();
+#endif
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// repetitive tasks
+////////////////////////////////////////////////////////////////////////////////
+uint32_t timeout_avoid_counter = 0;
 int16_t motor_setp = 0; // (torque related setpoint) to firmware of hoverboard
 float power1 = 0;       //actual power of hoverboard
 
@@ -403,238 +756,217 @@ enum charging_state
 };
 enum charging_state charging_state;
 
-// repetitive tasks
-
-void loop(void)
+void loop()
 {
-
   Receive(); //receiving hoverboard data should not be run in a task rate apparantly
 
+  switch (MODE)
+  {
+
+  case NORMAL_MODE:
+    if (deviceConnected)
+    {
+      digitalWrite(BUILTINLED, HIGH);
+      if (sendMode)
+      {
+        uint8_t fMode[] = {0xAA, FASTMODE};
+        pCharacteristicTX->setValue(fMode, 2);
+        pCharacteristicTX->notify();
+        delay(50);
+        sendMode = false;
+        Serial.print('.');
+      }
+
+      // your loop code here
+    }
+
+    else
+    {
+      digitalWrite(BUILTINLED, LOW);
+    }
+
+    // or here
+
 #if TASK_5MS
-  static long unsigned int a = micros();
-  if (micros() >= (a + 5000))
-  { //5 ms tasks
-    a = micros();
-    /* Tasklist: 5 ms */
-    Receive(); // Check for new received data
-  }
-  else if (micros() < a)
-    a = 0;
+    static long unsigned int a = micros();
+    if (micros() >= (a + 5000))
+    { //5 ms tasks
+      a = micros();
+      /* Tasklist: 5 ms */
+      Receive(); // Check for new received data
+    }
+    else if (micros() < a)
+      a = 0;
 #endif
 
 #if TASK_10MS
-  static long unsigned int b = micros();
-  if (micros() >= (b + 10000))
-  { //10 ms tasks
-    b = micros();
-    /* Tasklist: 10 ms */
+    static long unsigned int b = micros();
+    if (micros() >= (b + 10000))
+    { //10 ms tasks
+      b = micros();
+      /* Tasklist: 10 ms */
 
-    Send(0, motor_setp); //Send(int16_t uSteer, int16_t uSpeed)
-  }
-  else if (micros() < b)
-    b = 0;
+      // avoid timeout of firmware hoverboard
+      if (motor_setp < 50)
+      {
+        timeout_avoid_counter++;
+      }
+      else
+      {
+        timeout_avoid_counter = 0;
+      }
+
+      if (timeout_avoid_counter > 30000)
+      {
+        motor_setp = 101;
+        timeout_avoid_counter = 0;
+      }
+
+      // spin a bit when starting up, this is test code
+      if (timeout_avoid_counter < 1500)
+      {
+        motor_setp = 101;
+      }
+
+      // //send serial commands to hoverboard
+      // Send(0, motor_setp); //Send(int16_t uSteer, int16_t uSpeed)
+    }
+    else if (micros() < b)
+      b = 0;
 #endif
 
 #if TASK_200MS
-  static long unsigned int c = micros();
-  if (micros() >= (c + 200000))
-  { //200 ms tasks
-    c = micros();
-
-    if (ctrl_Motor_state.Torqueloop_enable == 1)
-    {
-      motor_setp = ctrl_Motor_state.Torqueloop_setp;
+    static long unsigned int c = micros();
+    if (micros() >= (c + 200000))
+    { //200 ms tasks
+      c = micros();
     }
-
-#if SPEEDLOOP_ESP
-    if (ctrl_Motor_state.Speedloop_enable == 1)
-    {
-      PI_speed = PI_loop(PI_speed, (float)(speed_left[buffer_index]), (float)(ctrl_Motor_state.Speedloop_setp));
-
-      // put some limits on output
-      if (PI_speed.output > 1000)
-      {
-        PI_speed.output = 1000;
-      }
-      else if (PI_speed.output < -1000)
-      {
-        PI_speed.output = -1000;
-      }
-      motor_setp = (int16_t)(PI_speed.output);
-    }
-#endif
-  }
-  else if (micros() < c)
-    c = 0;
+    else if (micros() < c)
+      c = 0;
 #endif
 
 #if TASK_500MS
-  static long unsigned int f = micros();
-  if (micros() >= (f + 500000))
-  { //500 ms tasks
-    f = micros();
-    /* Tasklist: 500 ms */
-    // only print first element of buffer
-    power1 = 3.1415 / 30 * (float)(speed_left[buffer_index]) * (float)(iq_buf[buffer_index]) / motorconstant;
-    float power2 = 0.01 * (float)(batVoltage_buf[buffer_index]) * 0.01 * (float)(left_dc_curr_buf[buffer_index]);
-
-#if CONNECTED_TO_PC
-    Serial.print("  timestamp: ");
-    Serial.print(timestamps_buff[buffer_index]);
-    Serial.print("  command: ");
-    Serial.print(motor_setp);
-    Serial.print("  speed_setp  ");
-    Serial.print(ctrl_Motor_state.Speedloop_setp);
-    Serial.print("  speed enbl  ");
-    Serial.print(ctrl_Motor_state.Speedloop_enable);
-    Serial.print("  spd_act[rpm]: ");
-    Serial.print(speed_left[buffer_index]);
-    Serial.print("  dc_curr[cA]: ");
-    Serial.print(left_dc_curr_buf[buffer_index]);
-    Serial.print("  batt_vlt[cV]: ");
-    Serial.print(batVoltage_buf[buffer_index]);
-    Serial.print("  iq[cA?]: ");
-    Serial.print(iq_buf[buffer_index]);
-    Serial.print("  temper [deci Cels]: ");
-    Serial.print(temp_board_buf[buffer_index]);
-
-    Serial.print(" power1: ");
-    // float power1 = 3.1415 / 30 * (float)(speed_left[buffer_index]) * (float)(iq_buf[buffer_index]) / motorconstant;
-    Serial.print(power1);
-
-    Serial.print("  power2: ");
-    // float power2 = 0.01 * (float)(batVoltage_buf[buffer_index]) * 0.01 * (float)(left_dc_curr_buf[buffer_index]);
-    Serial.print(power2);
-
-    Serial.print("  state:  ");
-    Serial.println(charging_state);
-#endif
-
-    // bluetooth non LE
-    // if (ESP_BT.available()) //Check if we receive anything from Bluetooth
-    // Serial.println("bluetooth start");
-    // {
-    // int incoming = ESP_BT.read(); //Read what we recevive
-    // if (incoming == 49)
-    // {
-    //   digitalWrite(LED_BUILTIN, HIGH);
-    //   ESP_BT.println("LED turned ON");
-    // }
-
-    // if (incoming == 48)
-    // {
-    //   digitalWrite(LED_BUILTIN, LOW);
-    //   ESP_BT.println("LED turned OFF");
-    // }
-
-    // ESP_BT.begin("  timestamp: ");
-    // ESP_BT.begin(timestamps_buff[buffer_index]);
-    // ESP_BT.begin("  command: ");
-    // ESP_BT.begin(motor_setp);
-    // ESP_BT.begin("  speed_setp  ");
-    // ESP_BT.begin(ctrl_Motor_state.Speedloop_setp);
-    // ESP_BT.begin("  speed enbl  ");
-    // ESP_BT.begin(ctrl_Motor_state.Speedloop_enable);
-    // ESP_BT.begin("  dc_curr[cA]: ");
-    // ESP_BT.begin(left_dc_curr_buf[buffer_index]);
-    // ESP_BT.begin("  batt_vlt[cV]: ");
-    // ESP_BT.begin(batVoltage_buf[buffer_index]);
-    // ESP_BT.begin("  spd_act[rpm]: ");
-    // ESP_BT.begin(speed_left[buffer_index]);
-    // ESP_BT.begin("  iq[cA?]: ");
-    // ESP_BT.begin(iq_buf[buffer_index]);
-    // ESP_BT.begin("  temper [deci Cels]: ");
-    // ESP_BT.begin(temp_board_buf[buffer_index]);
-    // ESP_BT.begin(" power1: ");
-    // // float power1 = 3.1415 / 30 * (float)(speed_left[buffer_index]) * (float)(iq_buf[buffer_index]) / motorconstant;
-    // ESP_BT.begin(power1);
-    // ESP_BT.begin("  power2: ");
-    // // float power2 = 0.01 * (float)(batVoltage_buf[buffer_index]) * 0.01 * (float)(left_dc_curr_buf[buffer_index]);
-    // ESP_BT.begin(power2);
-    // ESP_BT.begin("  state:  ");
-    // ESP_BT.begin(charging_state);
-
-    // Serial.println("bluetooth end");
-    // }
-
-    // if (profile_counter < 200)
-    // {
-    //   motor_setp = motor_setp + 1;
-    // }
-    // // else if ((profile_counter > 20) && (profile_counter < 40))
-    // // {
-    // //   motor_setp = motor_setp + 10;
-    // // }
-    // else
-    // {
-    //   motor_setp = 0;
-    // }
-
-    // profile_counter = profile_counter + 1;
-    // if (profile_counter > 300)
-    // {
-    //   profile_counter = 0;
-    // }
-
-    // for (int i = 0; i < 50; i++)
-    // {
-    //   Serial.print("  timestamp:");
-    //   Serial.print(timestamps_buff[i]);
-    //   Serial.print("  meas:");
-    //   Serial.println(speed_right[i]);
-    // }
-
-    // Receive();    // Check for new received data
-    // Send(0, 100); //Send(int16_t uSteer, int16_t uSpeed)
-  }
-  else if (micros() < f)
-    f = 0;
+    static long unsigned int f = micros();
+    if (micros() >= (f + 500000))
+    { //500 ms tasks
+      f = micros();
+      /* Tasklist: 500 ms */
+      // only print first element of buffer
+    }
+    else if (micros() < f)
+      f = 0;
 #endif
 
 #if TASK_1000MS
-  static long unsigned int g = micros();
-  if (micros() >= (g + 1000000))
-  { //1000 ms tasks
-    g = micros();
-    /* Tasklist: 1000 ms */
-    send_BLE((int16_t)(power1));
+    static long unsigned int g = micros();
+    if (micros() >= (g + 1000000))
+    { //1000 ms tasks
+      g = micros();
+      /* Tasklist: 1000 ms */
+      long time_since_last_update = abs(millis() - timestamps_buff[buffer_index]);
+      if (time_since_last_update > 5000)
+      {
+        charging_state = TorqueFree;
+      }
 
-    long time_since_last_update = abs(millis() - timestamps_buff[buffer_index]);
-    if (time_since_last_update > 5000)
-    {
-      charging_state = TorqueFree;
-    }
+      // desired state of windturbine
+      // if ((batVoltage_buf[buffer_index] > 4150) && (time_since_last_update < 5000))
+      // {
+      //   charging_state = DischargeBat;
+      // }
+      if ((batVoltage_buf[buffer_index] <= 4150) && (time_since_last_update < 5000))
+      {
+        charging_state = ChargeBat;
+      }
+      // else
+      // {
+      //   charging_state = TorqueFree;
+      // }
 
-    // desired state of windturbine
-    if ((batVoltage_buf[buffer_index] > 4150) && (time_since_last_update < 5000))
-    {
-      charging_state = DischargeBat;
-    }
-    else if ((batVoltage_buf[buffer_index] < 4100) && (time_since_last_update < 5000))
-    {
-      charging_state = ChargeBat;
-    }
+      // actions related to desired state
+      if (charging_state == DischargeBat)
+      {
+        ctrl_Motor_state = DisChargeBattery(power1, ctrl_Motor_state);
+      }
+      else if (charging_state == ChargeBat)
+      {
 
-    // actions related to desired state
-    if (charging_state == DischargeBat)
-    {
-      ctrl_Motor_state = DisChargeBattery(power1, ctrl_Motor_state);
-    }
-    else if (charging_state == ChargeBat)
-    {
+        ctrl_Motor_state = ChargeBattery(power1, speed_left[buffer_index], PI_speed.output, ctrl_Motor_state);
+      }
 
-      ctrl_Motor_state = ChargeBattery(power1, speed_left[buffer_index], PI_speed.output, ctrl_Motor_state);
+      if (charging_state == TorqueFree)
+      {
+        ctrl_Motor_state.Torqueloop_enable = 1;
+        ctrl_Motor_state.Speedloop_enable = 0;
+        ctrl_Motor_state.Torqueloop_setp = 0;
+        ctrl_Motor_state.Speedloop_setp = 0;
+      }
     }
-
-    if (charging_state == TorqueFree)
-    {
-      ctrl_Motor_state.Torqueloop_enable = 1;
-      ctrl_Motor_state.Speedloop_enable = 0;
-      ctrl_Motor_state.Torqueloop_setp = 0;
-      ctrl_Motor_state.Speedloop_setp = 0;
-    }
-  }
-  else if (micros() < g)
-    g = 0;
+    else if (micros() < g)
+      g = 0;
 #endif
+
+#if TASK_20000MS
+    static long unsigned int h = micros();
+    if (micros() >= (h + 20000000))
+    { //20000 ms tasks
+      h = micros();
+#if BLUETOOTH
+
+      Serial.print("update BLE values ");
+      Serial.println(timeout_avoid_counter);
+      send_BLE((int16_t)(timeout_avoid_counter), pCharacteristic1);
+      send_BLE((int16_t)(timeout_avoid_counter * 2), pCharacteristic2);
+      send_BLE((int16_t)(timeout_avoid_counter * 3), pCharacteristic3);
+      send_BLE((int16_t)(timeout_avoid_counter * 4), pCharacteristic4);
+
+#endif
+    }
+    else if (micros() < h)
+      h = 0;
+
+#endif
+
+    break;
+
+  case UPDATE_MODE:
+
+    if (request)
+    {
+      uint8_t rq[] = {0xF1, (cur + 1) / 256, (cur + 1) % 256};
+      pCharacteristicTX->setValue(rq, 3);
+      pCharacteristicTX->notify();
+      delay(50);
+      request = false;
+    }
+
+    if (cur + 1 == parts)
+    { // received complete file
+      uint8_t com[] = {0xF2, (cur + 1) / 256, (cur + 1) % 256};
+      pCharacteristicTX->setValue(com, 3);
+      pCharacteristicTX->notify();
+      delay(50);
+      MODE = OTA_MODE;
+    }
+
+    if (writeFile)
+    {
+      if (!current)
+      {
+        writeBinary(FLASH, "/update.bin", updater, writeLen);
+      }
+      else
+      {
+        writeBinary(FLASH, "/update.bin", updater2, writeLen2);
+      }
+      writeFile = false;
+    }
+
+    break;
+
+  case OTA_MODE:
+    // Serial.println("ota mode");
+    updateFromFS(FLASH);
+    break;
+  }
 }
