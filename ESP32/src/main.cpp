@@ -387,6 +387,8 @@ byte *p;                // Pointer declaration for the new received data
 byte incomingByte;
 byte incomingBytePrev;
 
+float motorconstant = 30; // cA/Nm, ugess
+
 //rolling buffer to store last 50 samples of measurements
 int16_t left_dc_curr_buf[50] = {0};
 int16_t speed_left[50] = {0};
@@ -863,6 +865,9 @@ void loop()
     { //1000 ms tasks
       g = micros();
       /* Tasklist: 1000 ms */
+
+      power1 = 3.1415 / 30 * (float)(speed_left[buffer_index]) * (float)(iq_buf[buffer_index]) / motorconstant;
+
       long time_since_last_update = abs(millis() - timestamps_buff[buffer_index]);
       if (time_since_last_update > 5000)
       {
@@ -912,13 +917,15 @@ void loop()
     { //20000 ms tasks
       h = micros();
 #if BLUETOOTH
-
+#if CONNECTED_TO_PC
       Serial.print("update BLE values ");
-      Serial.println(timeout_avoid_counter);
-      send_BLE((int16_t)(timeout_avoid_counter), pCharacteristic1);
-      send_BLE((int16_t)(timeout_avoid_counter * 2), pCharacteristic2);
-      send_BLE((int16_t)(timeout_avoid_counter * 3), pCharacteristic3);
-      send_BLE((int16_t)(timeout_avoid_counter * 4), pCharacteristic4);
+#endif
+
+      // Serial.println(timeout_avoid_counter);
+      send_BLE((int16_t)(power1), pCharacteristic1);
+      send_BLE((int16_t)(batVoltage_buf[buffer_index]), pCharacteristic2);
+      send_BLE((int16_t)(speed_left[buffer_index]), pCharacteristic3);
+      send_BLE((int16_t)(charging_state), pCharacteristic4);
 
 #endif
     }
