@@ -2,23 +2,25 @@
 // 31 may 2021: added multiple BLE characteristics
 // 01 jun 2021: added three BLE characteristics, added absolute value check to charge battery
 // 6 jun 2021: trying to avoid time-outs
-// 14 jun 2021: included bluetooth low energy over the air update from Felix Biego https://github.com/fbiego/ESP32_BLE_OTA_Arduino --> not functioning yet
+// 14 jun 2021: included bluetooth low energy over the air update from Felix Biego https://github.com/fbiego/ESP32_BLE_OTA_Arduino
+// 26 jun 2021: added MQTT messages and OTA over wifi + together with 2nd ESP using https://github.com/martin-ger/esp32_nat_router
 
 #include <Arduino.h>
-#include <Update.h>
-#include "FS.h"
-#include "FFat.h"
-#include "SPIFFS.h"
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEServer.h>
-#include <BLE2902.h>
+#include <WiFi.h>
+#include <PubSubClient.h> //For MQTT
+#include <WiFiUdp.h>      //For OTA
+#include <ArduinoOTA.h>   //For OTA
+#include <ESPmDNS.h>      //For OTA
+// #include <esp_wifi.h>
 
-#define SERIAL_BAUD 57600 // [-] Baud rate for built-in Serial (used for the Serial Monitor)
+#define SERIAL_BAUD 57600 // [-] Baud rate for built-in Serial (used for the Serial Monitor when connected to pc)
+#define CONNECTED_TO_PC 0 // to enable/disable serial printout in majority of cases
+#define BLUETOOTH 0       // to send BLE messages and allow OTA-BLE
+#define WIFIMQTT 1        // send mqtt messages
+#define SPEEDSIGN -1      //-1 or 1, 1 if the blades rotate at positive speed in the wind, -1 when negative
 
 #define HOVER_SERIAL_BAUD 115200 // [-] Baud rate for Serial2 (used to communicate with the hoverboard)
 #define START_FRAME 0xABCD
-#define CONNECTED_TO_PC 1 // to enable/disable serial printout
 
 //only pick one taskrate for this simple test
 #define TASK_20000MS 1 //simple task scheduling of 20 second
@@ -28,9 +30,37 @@
 #define TASK_10MS 1
 #define TASK_5MS 0
 
-#define BLUETOOTH 1 // to send BLE messages
+#if WIFIMQTT
+
+#include "configuration.h" // to store passwords of mqtt and wifi
+
+//MQTT client
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient);
+
+//Necesary to make Arduino Software autodetect OTA device
+WiFiServer TelnetServer(8266);
+
+//mqtt
+String mqtt_client_id = "HOVERWIND"; //This text is concatenated with ChipId to get unique client_id
+String mqtt_base_topic = "/HOVERWIND";
+#define spd_topic "/speed"
+#define trq_topic "/torque"
+#define volt_topic "/volt"
+#define power_topic "/power"
+
+#endif
 
 #if BLUETOOTH
+#include <Update.h>
+#include "FS.h"
+#include "FFat.h"
+#include "SPIFFS.h"
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
 BLEServer *pServer;
 BLEService *pService;
 BLEAdvertising *pAdvertising;
@@ -54,7 +84,7 @@ static BLECharacteristic *pCharacteristicRX;
 #define CHARACTERISTIC_UUID_TX "fb1e4003-54ae-4a28-9f74-dfccb248601d"
 
 // BLUETOOTH OTA definitions
-#define BUILTINLED 2
+// #define BUILTINLED 2
 #define FORMAT_SPIFFS_IF_FAILED true
 #define FORMAT_FFAT_IF_FAILED true
 #define USE_SPIFFS //comment to use FFat
@@ -377,6 +407,13 @@ void initBLE()
 #endif
 }
 
+void send_BLE(int16_t value, BLECharacteristic *pCharacteristic)
+{
+  char buffer[80];
+  dtostrf(value, 1, 2, buffer);
+  pCharacteristic->setValue(buffer);
+  pCharacteristic->notify(); // send notification of change
+}
 #endif
 /////////////////////////////////////////////////////////////////////////////////
 ////////////////////// FUNCTIONS and structs HOVER /////////////////////////////////////////
@@ -445,14 +482,6 @@ struct ctrl_Motor
 };
 struct ctrl_Motor ctrl_Motor_state = {0, 0, 0, 0};
 
-void send_BLE(int16_t value, BLECharacteristic *pCharacteristic)
-{
-  char buffer[80];
-  dtostrf(value, 1, 2, buffer);
-  pCharacteristic->setValue(buffer);
-  pCharacteristic->notify(); // send notification of change
-}
-
 void Send(int16_t uSteer, int16_t uSpeed)
 {
   // send commands to hoverboard over uart (unfortunately in an inconvenient structure of steer and speed)
@@ -465,6 +494,52 @@ void Send(int16_t uSteer, int16_t uSpeed)
   // Write to Serial
   Serial2.write((uint8_t *)&Command, sizeof(Command));
 }
+
+#if WIFIMQTT
+void mqtt_reconnect()
+{
+
+  // Loop until we're reconnected
+  uint8_t cntr = 0;
+  while (!mqtt_client.connected() && cntr < 5)
+  {
+    cntr++;
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (mqtt_client.connect(mqtt_client_id.c_str(), mqtt_user, mqtt_password))
+    {
+      Serial.println("connected");
+    }
+    else
+    {
+      Serial.print("failed, rc=");
+      Serial.print(mqtt_client.state());
+      Serial.println(" try again");
+      delay(500);
+    }
+  }
+}
+
+void setup_wifi()
+{
+  delay(10);
+  Serial.print("Connecting to ");
+  Serial.print(wifi_ssid);
+  WiFi.begin(wifi_ssid, wifi_password);
+  uint8_t cntr = 0;
+
+  while (WiFi.status() != WL_CONNECTED && cntr < 25)
+  {
+    delay(500);
+    Serial.println(cntr);
+    cntr++;
+  }
+  Serial.println("OK");
+  Serial.print("   IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+#endif
 
 // ########################## RECEIVE ##########################
 void Receive()
@@ -635,7 +710,7 @@ struct ctrl_Motor DisChargeBattery(float powerMotr_watt, ctrl_Motor ctrl_MotorIn
   //}
   struct ctrl_Motor ctrl_MtrOut;
 
-  ctrl_MtrOut.Speedloop_setp = ctrl_MotorIn.Speedloop_setp;
+  ctrl_MtrOut.Speedloop_setp = abs(ctrl_MotorIn.Speedloop_setp);
   ctrl_MtrOut.Speedloop_enable = 1;
   ctrl_MtrOut.Torqueloop_enable = 0;
   ctrl_MtrOut.Torqueloop_setp = 0;
@@ -654,6 +729,8 @@ struct ctrl_Motor DisChargeBattery(float powerMotr_watt, ctrl_Motor ctrl_MotorIn
     ctrl_MtrOut.Speedloop_setp = 500;
   }
 
+  ctrl_MtrOut.Speedloop_setp = SPEEDSIGN * ctrl_MtrOut.Speedloop_setp;
+
   return ctrl_MtrOut;
 }
 
@@ -665,10 +742,11 @@ struct ctrl_Motor ChargeBattery(float powerMotr_watt, int16_t speed_mtr, float c
 
   // torque command is low and motor is rotating --> turbine is generating and overcoming the "electric brake" torque
   // increase speed to get to a more efficient zone
-  if ((speed_mtr > 50) && (abs(command_trq) < 25))
+  // needs some additional filtering instead of instant values
+  if ((abs(speed_mtr) > 35) && (abs(command_trq) < 25))
   {
     ctrl_MtrOut.Speedloop_enable = 1;
-    ctrl_MtrOut.Speedloop_setp = 200;
+    ctrl_MtrOut.Speedloop_setp = 125;
     ctrl_MtrOut.Torqueloop_enable = 0;
     ctrl_MtrOut.Torqueloop_setp = 0;
   }
@@ -678,11 +756,11 @@ struct ctrl_Motor ChargeBattery(float powerMotr_watt, int16_t speed_mtr, float c
   {
     // if power gets positive, it's not generating power --> decrease speed setpoint
     ctrl_MtrOut.Speedloop_enable = 1;
-    ctrl_MtrOut.Speedloop_setp = ctrl_MotorIn.Speedloop_setp - 1;
+    ctrl_MtrOut.Speedloop_setp = abs(ctrl_MotorIn.Speedloop_setp) - 1;
     ctrl_MtrOut.Torqueloop_enable = 0;
     ctrl_MtrOut.Torqueloop_setp = 0;
 
-    if (ctrl_MtrOut.Speedloop_setp < 50)
+    if (ctrl_MtrOut.Speedloop_setp < 30)
     {
       // if speed needs to get too low, just let the automatic brake torque from the hoverboard firmware kick in
       // (parameters ELECTRIC_BRAKE_ENABLE, ELECTRIC_BRAKE_MAX,ELECTRIC_BRAKE_THRES)
@@ -691,6 +769,8 @@ struct ctrl_Motor ChargeBattery(float powerMotr_watt, int16_t speed_mtr, float c
       ctrl_MtrOut.Torqueloop_enable = 1;
       ctrl_MtrOut.Torqueloop_setp = 0;
     }
+
+    ctrl_MtrOut.Speedloop_setp = SPEEDSIGN * ctrl_MtrOut.Speedloop_setp;
   }
 
   return ctrl_MtrOut;
@@ -703,12 +783,12 @@ void setup()
 {
   // setCpuFrequencyMhz(80);           //powering from the 5v of the hall sensors, reducing clock frequency hoping not to exceed 100mA
   Serial2.begin(HOVER_SERIAL_BAUD); //used to communicate with hoverboard
+  pinMode(LED_BUILTIN, OUTPUT);
 
 #if CONNECTED_TO_PC
   Serial.begin(SERIAL_BAUD);
-  Serial.println("Starting BLE OTA sketch");
+  Serial.println("Starting hoverturbine ketch");
 #endif
-  pinMode(BUILTINLED, OUTPUT);
 
   // PI controller for voltage regulation
   PI_speed.Kp = 0.3;
@@ -739,6 +819,50 @@ void setup()
 
   initBLE();
 #endif
+
+#if WIFIMQTT
+
+  setup_wifi();
+
+  //OTA things
+  Serial.print("Configuring OTA device...");
+  TelnetServer.begin(); //Necesary to make Arduino Software autodetect OTA device
+  ArduinoOTA.onStart([]()
+                     { Serial.println("OTA starting..."); });
+  ArduinoOTA.onEnd([]()
+                   {
+                     Serial.println("OTA update finished!");
+                     Serial.println("Rebooting...");
+                   });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
+                        { Serial.printf("OTA in progress: %u%%\r\n", (progress / (total / 100))); });
+  ArduinoOTA.onError([](ota_error_t error)
+                     {
+                       Serial.printf("Error[%u]: ", error);
+                       if (error == OTA_AUTH_ERROR)
+                         Serial.println("Auth Failed");
+                       else if (error == OTA_BEGIN_ERROR)
+                         Serial.println("Begin Failed");
+                       else if (error == OTA_CONNECT_ERROR)
+                         Serial.println("Connect Failed");
+                       else if (error == OTA_RECEIVE_ERROR)
+                         Serial.println("Receive Failed");
+                       else if (error == OTA_END_ERROR)
+                         Serial.println("End Failed");
+                     });
+  ArduinoOTA.begin();
+  Serial.println("OTA OK");
+
+  mqtt_client.setServer(mqtt_server, 1883);
+#if CONNECTED_TO_PC
+  Serial.println("Configuring MQTT server...");
+  Serial.printf("   Server IP: %s\r\n", mqtt_server);
+  Serial.printf("   Username:  %s\r\n", mqtt_user);
+  // Serial.println("   Cliend Id: " + mqtt_client_id);
+  Serial.println("   MQTT configured!");
+  Serial.println("Setup completed! Running app...");
+#endif
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -760,7 +884,10 @@ enum charging_state charging_state;
 
 void loop()
 {
-  Receive(); //receiving hoverboard data should not be run in a task rate apparantly
+
+  ArduinoOTA.handle();
+
+#if BLUETOOTH
 
   switch (MODE)
   {
@@ -768,7 +895,7 @@ void loop()
   case NORMAL_MODE:
     if (deviceConnected)
     {
-      digitalWrite(BUILTINLED, HIGH);
+      digitalWrite(LED_BUILTIN, HIGH);
       if (sendMode)
       {
         uint8_t fMode[] = {0xAA, FASTMODE};
@@ -784,10 +911,12 @@ void loop()
 
     else
     {
-      digitalWrite(BUILTINLED, LOW);
+      digitalWrite(LED_BUILTIN, LOW);
     }
 
     // or here
+#endif
+    Receive(); //receiving hoverboard data should not be run in a task rate apparantly
 
 #if TASK_5MS
     static long unsigned int a = micros();
@@ -809,7 +938,7 @@ void loop()
       /* Tasklist: 10 ms */
 
       // avoid timeout of firmware hoverboard
-      if (motor_setp < 50)
+      if (abs(motor_setp) < 50)
       {
         timeout_avoid_counter++;
       }
@@ -820,14 +949,14 @@ void loop()
 
       if (timeout_avoid_counter > 30000)
       {
-        motor_setp = 101;
+        motor_setp = SPEEDSIGN * 101;
         timeout_avoid_counter = 0;
       }
 
       // spin a bit when starting up, this is test code
       if (timeout_avoid_counter < 1500)
       {
-        motor_setp = 101;
+        motor_setp = SPEEDSIGN * 101;
       }
 
       // //send serial commands to hoverboard
@@ -842,6 +971,27 @@ void loop()
     if (micros() >= (c + 200000))
     { //200 ms tasks
       c = micros();
+
+      if (ctrl_Motor_state.Torqueloop_enable == 1)
+      {
+        motor_setp = ctrl_Motor_state.Torqueloop_setp;
+      }
+
+      if (ctrl_Motor_state.Speedloop_enable == 1)
+      {
+        PI_speed = PI_loop(PI_speed, (float)(speed_left[buffer_index]), (float)(ctrl_Motor_state.Speedloop_setp));
+
+        // put some limits on output
+        if (PI_speed.output > 1000)
+        {
+          PI_speed.output = 1000;
+        }
+        else if (PI_speed.output < -1000)
+        {
+          PI_speed.output = -1000;
+        }
+        motor_setp = (int16_t)(PI_speed.output);
+      }
     }
     else if (micros() < c)
       c = 0;
@@ -879,7 +1029,7 @@ void loop()
       // {
       //   charging_state = DischargeBat;
       // }
-      if ((batVoltage_buf[buffer_index] <= 4150) && (time_since_last_update < 5000))
+      if ((batVoltage_buf[buffer_index] <= 4250) && (time_since_last_update < 5000))
       {
         charging_state = ChargeBat;
       }
@@ -916,6 +1066,23 @@ void loop()
     if (micros() >= (h + 20000000))
     { //20000 ms tasks
       h = micros();
+
+#if WIFIMQTT
+      if (!mqtt_client.connected())
+      {
+        mqtt_reconnect();
+      }
+
+      // Serial.println("mqtt crap");
+      // Serial.println(motor_setp);
+
+      mqtt_client.publish((mqtt_base_topic + spd_topic).c_str(), String((float_t)(speed_left[buffer_index]), 2).c_str(), true);
+      mqtt_client.publish((mqtt_base_topic + trq_topic).c_str(), String((float_t)motor_setp, 2).c_str(), true);
+      mqtt_client.publish((mqtt_base_topic + volt_topic).c_str(), String((float_t)(batVoltage_buf[buffer_index]), 2).c_str(), true);
+      mqtt_client.publish((mqtt_base_topic + power_topic).c_str(), String((float_t)(power1), 2).c_str(), true);
+
+#endif
+
 #if BLUETOOTH
 #if CONNECTED_TO_PC
       Serial.print("update BLE values ");
@@ -933,6 +1100,8 @@ void loop()
       h = 0;
 
 #endif
+
+#if BLUETOOTH
 
     break;
 
@@ -976,4 +1145,6 @@ void loop()
     updateFromFS(FLASH);
     break;
   }
+
+#endif
 }
