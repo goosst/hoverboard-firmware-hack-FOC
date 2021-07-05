@@ -14,7 +14,7 @@
 // #include <esp_wifi.h>
 
 #define SERIAL_BAUD 57600 // [-] Baud rate for built-in Serial (used for the Serial Monitor when connected to pc)
-#define CONNECTED_TO_PC 0 // to enable/disable serial printout in majority of cases
+#define CONNECTED_TO_PC 1 // to enable/disable serial printout in majority of cases
 #define BLUETOOTH 0       // to send BLE messages and allow OTA-BLE
 #define WIFIMQTT 1        // send mqtt messages
 #define SPEEDSIGN -1      //-1 or 1, 1 if the blades rotate at positive speed in the wind, -1 when negative
@@ -48,6 +48,7 @@ String mqtt_base_topic = "/HOVERWIND";
 #define trq_topic "/torque"
 #define volt_topic "/volt"
 #define power_topic "/power"
+#define counter_topic "/cntr"
 
 #endif
 
@@ -522,9 +523,9 @@ void mqtt_reconnect()
 
 void setup_wifi()
 {
-  delay(10);
-  Serial.print("Connecting to ");
-  Serial.print(wifi_ssid);
+  // delay(10);
+  // Serial.print("Connecting to ");
+  // Serial.print(wifi_ssid);
   WiFi.begin(wifi_ssid, wifi_password);
   uint8_t cntr = 0;
 
@@ -537,6 +538,11 @@ void setup_wifi()
   Serial.println("OK");
   Serial.print("   IP address: ");
   Serial.println(WiFi.localIP());
+
+  if (cntr < 25)
+  {
+    digitalWrite(BUILTIN_LED, !digitalRead(BUILTIN_LED)); //blink LED when connected to wifi
+  }
 }
 
 #endif
@@ -873,6 +879,7 @@ int16_t motor_setp = 0; // (torque related setpoint) to firmware of hoverboard
 float power1 = 0;       //actual power of hoverboard
 
 uint16_t profile_counter = 0;
+uint16_t message_counter = 0;
 
 enum charging_state
 {
@@ -1070,16 +1077,26 @@ void loop()
 #if WIFIMQTT
       if (!mqtt_client.connected())
       {
+        setup_wifi();
         mqtt_reconnect();
       }
 
       // Serial.println("mqtt crap");
       // Serial.println(motor_setp);
 
+      message_counter = message_counter + 1;
+      if (message_counter > 65533)
+      {
+        message_counter = 0;
+      }
+
       mqtt_client.publish((mqtt_base_topic + spd_topic).c_str(), String((float_t)(speed_left[buffer_index]), 2).c_str(), true);
       mqtt_client.publish((mqtt_base_topic + trq_topic).c_str(), String((float_t)motor_setp, 2).c_str(), true);
       mqtt_client.publish((mqtt_base_topic + volt_topic).c_str(), String((float_t)(batVoltage_buf[buffer_index]), 2).c_str(), true);
       mqtt_client.publish((mqtt_base_topic + power_topic).c_str(), String((float_t)(power1), 2).c_str(), true);
+      mqtt_client.publish((mqtt_base_topic + counter_topic).c_str(), String((float_t)(message_counter), 2).c_str(), true);
+
+      // digitalWrite(BUILTIN_LED, !digitalRead(BUILTIN_LED)); //blink LED when connected
 
 #endif
 
